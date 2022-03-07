@@ -131,10 +131,10 @@ impl Deployment {
 
                     let mut db_state = database::State::default();
 
-                    let factory =
+                    let mut factory =
                         UnveilFactory::new(&mut db_state, meta.config.clone(), db_context.clone());
 
-                    let deployed_future = match loaded.service.deploy(&factory) {
+                    let deployed_future = match loaded.service.deploy(&mut factory).await {
                         unveil_service::Deployment::Rocket(r) => {
                             if let database::State::Ready(ready) = &db_state {
                                 self.meta.write().await.database_deployment = Some(ready.clone());

@@ -1,5 +1,5 @@
 use std::any::Any;
-
+use async_trait::async_trait;
 use rocket::{Build, Rocket};
 
 mod error;
@@ -8,11 +8,12 @@ mod factory;
 pub use error::Error;
 pub use factory::Factory;
 
+#[async_trait]
 pub trait Service
 where
     Self: Any + Send + Sync,
 {
-    fn deploy(&self, factory: &dyn Factory) -> Deployment;
+    async fn deploy(&self, factory: &mut dyn Factory) -> Deployment;
 }
 
 pub enum Deployment {
