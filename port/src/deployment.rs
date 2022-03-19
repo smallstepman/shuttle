@@ -203,7 +203,9 @@ impl Deployment {
     }
 
     async fn update_meta_state(&self) {
-        self.meta.write().await.state = self.state.read().await.meta()
+        let mut meta = self.meta.write().await;
+        meta.port = self.port().await;
+        meta.state = self.state.read().await.meta()
     }
 
     async fn port(&self) -> Option<Port> {
@@ -292,6 +294,7 @@ pub(crate) struct DeploymentSystem {
     deployments: RwLock<Deployments>,
     job_queue: JobQueue,
     router: Arc<Router>,
+    control_key: String
 }
 
 const JOB_QUEUE_SIZE: usize = 200;
@@ -366,11 +369,19 @@ impl DeploymentSystem {
             job_queue.push(deployment.clone()).await;
         }
 
+        let control_key = std::env::var("SHUTTLE_CONTROL_PLANE_SECRET")
+            .expect("SHUTTLE_CONTROL_PLANE_SECRET must be set");
+
         Self {
             deployments: Default::default(),
             job_queue,
             router,
+            control_key
         }
+    }
+
+    pub fn is_authorized<S: AsRef<str>>(&self, secret: S) -> bool {
+        self.control_key == secret.as_ref()
     }
 
     /// Traverse the build directory re-create deployments.

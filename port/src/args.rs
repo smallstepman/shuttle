@@ -10,16 +10,10 @@ pub struct Args {
     pub(crate) path: Option<PathBuf>,
     #[structopt(
         long,
-        about = "Override the default port for the proxy",
-        default_value = "8000"
-    )]
-    pub(crate) proxy_port: Port,
-    #[structopt(
-        long,
         about = "Override the default port for the api",
         default_value = "8001"
     )]
-    pub(crate) api_port: Port,
+    pub(crate) bind_port: Port,
     #[structopt(
         long,
         about = "Override the default bind address",

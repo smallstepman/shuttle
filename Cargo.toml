@@ -1,6 +1,7 @@
 [workspace]
 members = [
-  "api",
+  "port",
+  "gateway",
   "service",
   "cargo-shuttle",
   "common",

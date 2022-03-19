@@ -5,16 +5,12 @@ extern crate rocket;
 extern crate log;
 
 mod args;
-mod auth;
-mod auth_admin;
 mod build;
 mod database;
 mod deployment;
 mod factory;
-mod proxy;
 mod router;
 
-use auth_admin::Admin;
 use deployment::MAX_DEPLOYS;
 use factory::ShuttleFactory;
 use rocket::serde::json::Json;
@@ -27,43 +23,64 @@ use structopt::StructOpt;
 use uuid::Uuid;
 
 use crate::args::Args;
-use crate::auth::{ApiKey, AuthorizationError, ScopedUser, User, UserDirectory};
 use crate::build::{BuildSystem, FsBuildSystem};
 use crate::deployment::DeploymentSystem;
+use rocket::request::FromRequest;
+use shuttle_service::rocket::Request;
+use shuttle_service::rocket::request::Outcome;
+use rocket::http::Status;
 
 type ApiResult<T, E> = Result<Json<T>, E>;
 
-/// Find user by username and return it's API Key.
-/// if user does not exist create it and update `users` state to `users.toml`.
-/// Finally return user's API Key.
-#[post("/users/<username>")]
-async fn get_or_create_user(
-    user_directory: &State<UserDirectory>,
-    username: String,
-    _admin: Admin,
-) -> Result<ApiKey, AuthorizationError> {
-    user_directory.get_or_create(username)
+struct ControlGuard;
+
+#[async_trait]
+impl<'r> FromRequest<'r> for ControlGuard {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let state: &'r State<ApiState> = rocket::outcome::try_outcome!(request.guard().await.map_failure(|(s, _)| {
+            (s, "a ControlGuard was used in a route without a state")
+        }));
+        if let Some(auth) = request.headers().get_one("Authorization") {
+            let parts: Vec<&str> = auth.split(' ').collect();
+            if parts.len() != 2 {
+                return Outcome::Failure((Status::Unauthorized, "a request to the control plane was blocked: bad request"));
+            }
+            // unwrap ok because of explicit check above
+            let secret = *parts.get(1).unwrap();
+            if state.deployment_manager.is_authorized(secret) {
+                Outcome::Success(ControlGuard)
+            } else {
+                Outcome::Failure((Status::Unauthorized, "a request to the control plane was blocked: wrong key"))
+            }
+        } else {
+            return Outcome::Failure((Status::Unauthorized, "a request to the control plane was blocked: no auth"));
+        }
+    }
 }
 
 /// Status API to be used to check if the service is alive
 #[get("/status")]
 async fn status() {}
 
-#[get("/<_>/deployments/<id>")]
+#[get("/<service>/deployments/<id>")]
 async fn get_deployment(
     state: &State<ApiState>,
+    service: String,
     id: Uuid,
-    _user: ScopedUser,
+    _guard: ControlGuard,
 ) -> ApiResult<DeploymentMeta, DeploymentApiError> {
     let deployment = state.deployment_manager.get_deployment(&id).await?;
     Ok(Json(deployment))
 }
 
-#[delete("/<_>/deployments/<id>")]
+#[delete("/<service>/deployments/<id>")]
 async fn delete_deployment(
     state: &State<ApiState>,
+    service: String,
     id: Uuid,
-    _user: ScopedUser,
+    _guard: ControlGuard,
 ) -> ApiResult<DeploymentMeta, DeploymentApiError> {
     // TODO why twice?
     let _deployment = state.deployment_manager.get_deployment(&id).await?;
@@ -71,49 +88,43 @@ async fn delete_deployment(
     Ok(Json(deployment))
 }
 
-#[get("/<_>")]
+#[get("/<service>/deployments")]
 async fn get_project(
     state: &State<ApiState>,
-    user: ScopedUser,
+    service: ProjectName,
+    _guard: ControlGuard,
 ) -> ApiResult<DeploymentMeta, DeploymentApiError> {
     let deployment = state
         .deployment_manager
-        .get_deployment_for_project(user.scope())
+        .get_deployment_for_project(&service)
         .await?;
 
     Ok(Json(deployment))
 }
 
-#[delete("/<_>")]
+#[delete("/<service>")]
 async fn delete_project(
     state: &State<ApiState>,
-    user: ScopedUser,
+    service: ProjectName,
+    _guard: ControlGuard,
 ) -> ApiResult<DeploymentMeta, DeploymentApiError> {
     let deployment = state
         .deployment_manager
-        .kill_deployment_for_project(user.scope())
+        .kill_deployment_for_project(&service)
         .await?;
     Ok(Json(deployment))
 }
 
-#[post("/<project_name>", data = "<crate_file>")]
+#[post("/<service>", data = "<crate_file>")]
 async fn create_project(
     state: &State<ApiState>,
-    user_directory: &State<UserDirectory>,
     crate_file: Data<'_>,
-    project_name: ProjectName,
-    user: User,
+    service: ProjectName,
+    _guard: ControlGuard,
 ) -> ApiResult<DeploymentMeta, DeploymentApiError> {
-    if !user
-        .projects
-        .iter()
-        .any(|my_project| *my_project == project_name)
-    {
-        user_directory.create_project_if_not_exists(&user.name, &project_name)?;
-    }
     let deployment = state
         .deployment_manager
-        .deploy(crate_file, project_name)
+        .deploy(crate_file, service)
         .await?;
     Ok(Json(deployment))
 }
@@ -147,21 +158,16 @@ async fn rocket() -> Rocket<Build> {
     let build_system = FsBuildSystem::initialise(args.path).unwrap();
     let deployment_manager = Arc::new(DeploymentSystem::new(Box::new(build_system)).await);
 
-    start_proxy(args.bind_addr, args.proxy_port, deployment_manager.clone()).await;
-
     let state = ApiState { deployment_manager };
-
-    let user_directory =
-        UserDirectory::from_user_file().expect("could not initialise user directory");
 
     let config = rocket::Config {
         address: args.bind_addr,
-        port: args.api_port,
+        port: args.bind_port,
         ..Default::default()
     };
     rocket::custom(config)
         .mount(
-            "/projects",
+            "/services",
             routes![
                 delete_deployment,
                 get_deployment,
@@ -170,15 +176,6 @@ async fn rocket() -> Rocket<Build> {
                 get_project,
             ],
         )
-        .mount("/", routes![get_or_create_user, status])
+        .mount("/", routes![status])
         .manage(state)
-        .manage(user_directory)
-}
-
-async fn start_proxy(
-    bind_addr: IpAddr,
-    proxy_port: Port,
-    deployment_manager: Arc<DeploymentSystem>,
-) {
-    tokio::spawn(async move { proxy::start(bind_addr, proxy_port, deployment_manager).await });
 }
